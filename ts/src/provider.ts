@@ -41,6 +41,12 @@ export default interface Provider {
     commitment?: Commitment,
     includeAccounts?: boolean | PublicKey[]
   ): Promise<SuccessfulTxSimulationResponse>;
+  registerSendAndConfirm?(
+    tx: Transaction,
+    register: (sig: string) => boolean,
+    signers?: Signer[],
+    opts?: ConfirmOptions
+  ): Promise<TransactionSignature>;
 }
 
 /**
@@ -141,6 +147,66 @@ export class AnchorProvider implements Provider {
     (signers ?? []).forEach((kp) => {
       tx.partialSign(kp);
     });
+
+    const rawTx = tx.serialize();
+
+    try {
+      return await sendAndConfirmRawTransaction(this.connection, rawTx, opts);
+    } catch (err) {
+      // thrown if the underlying 'confirmTransaction' encounters a failed tx
+      // the 'confirmTransaction' error does not return logs so we make another rpc call to get them
+      if (err instanceof ConfirmError) {
+        // choose the shortest available commitment for 'getTransaction'
+        // (the json RPC does not support any shorter than "confirmed" for 'getTransaction')
+        // because that will see the tx sent with `sendAndConfirmRawTransaction` no matter which
+        // commitment `sendAndConfirmRawTransaction` used
+        const failedTx = await this.connection.getTransaction(
+          bs58.encode(tx.signature!),
+          { commitment: "confirmed" }
+        );
+        if (!failedTx) {
+          throw err;
+        } else {
+          const logs = failedTx.meta?.logMessages;
+          throw !logs ? err : new SendTransactionError(err.message, logs);
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Registers a transaction signature upstream then upon success sends the given transaction, paid for and signed by the provider's wallet.
+   *
+   * @param tx          The transaction to send.
+   * @param register    The register callback.
+   * @param signers     The signers of the transaction.
+   * @param opts        Transaction confirmation options.
+   */
+  async registerSendAndConfirm(
+    tx: Transaction,
+    register: (sig: string) => boolean,
+    signers?: Signer[],
+    opts?: ConfirmOptions
+  ): Promise<TransactionSignature> {
+    if (opts === undefined) {
+      opts = this.opts;
+    }
+
+    tx.feePayer = this.wallet.publicKey;
+    tx.recentBlockhash = (
+      await this.connection.getRecentBlockhash(opts.preflightCommitment)
+    ).blockhash;
+
+    tx = await this.wallet.signTransaction(tx);
+    (signers ?? []).forEach((kp) => {
+      tx.partialSign(kp);
+    });
+
+    if (!register(tx.signature)) {
+      throw new Error("Signature registration failed"));
+    }
 
     const rawTx = tx.serialize();
 
